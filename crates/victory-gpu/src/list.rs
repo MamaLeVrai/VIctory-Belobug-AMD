@@ -195,10 +195,17 @@ pub(crate) fn submitted(this: This) -> Vec<Submitted> {
 /// into another host list, with the state the title set.
 #[cfg(windows)]
 fn cut(this: This) {
-    if !host_list(this).is_some_and(|l| l.worked()) {
-        return;
+    if host_list(this).is_some_and(|l| l.worked()) {
+        part(this);
     }
-    let Some(next) = spare() else { return };
+}
+
+/// Ends a list's host list here: it is closed and kept as a part, with
+/// its waits and writes, and the recording goes on in another host list,
+/// with the state the title set. `false` if there was none to go on in.
+#[cfg(windows)]
+fn part(this: This) -> bool {
+    let Some(next) = spare() else { return false };
     // SAFETY: one of our lists; the title uses it on one thread at a time,
     // and no reference to the host list is in use here.
     let (host, parts, state) = unsafe {
@@ -214,6 +221,58 @@ fn cut(this: This) {
     if let Some(next) = host {
         state.continue_in(next);
     }
+    true
+}
+
+/// The most of the title's dispatches one host list holds before the
+/// recording is cut ([`cut_after_dispatches`]): `VICTORY_CUT_DISPATCHES`,
+/// 32 unless set; `0` cuts nothing.
+#[cfg(windows)]
+fn dispatches_per_part() -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_CUT_DISPATCHES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// Before one of the title's dispatches (direct or indirect): with
+/// [`dispatches_per_part`] of them recorded in its host list already, the
+/// recording is cut here without a wait ([`part`]), and each part goes to
+/// the queue in a call of its own (`crate::host`'s `submit_each`). The
+/// system takes the card back only between the packets it is given (an RX
+/// 6600 XT reports compute preemption at DMA-buffer boundaries only), and
+/// one that runs past the timeout (2 s) resets the driver: on that card
+/// ZSlayerHQ/victory-world-runtime#10 lost the device in a list of 182
+/// indirect dispatches (1,149 host commands), and a device loss here on an
+/// RX 6600 (#151) had dispatches of lists of 638 and 165 operations in
+/// flight.
+///
+/// Not while a query begun in the host list runs: the host ends it with
+/// the list (`HostList::close`), and it would miss the rest. The part after
+/// the cut counts the work before it as its own: its writes stay behind
+/// that work (none is written early, `HostList::write_early`), and a wait
+/// that follows them cuts again ([`cut`]).
+#[cfg(windows)]
+fn cut_after_dispatches(this: This) {
+    let most = dispatches_per_part();
+    let full = host_list(this)
+        .is_some_and(|l| most > 0 && l.dispatches() >= most && l.open_queries() == 0);
+    if !full || !part(this) {
+        return;
+    }
+    if let Some(next) = host_list(this) {
+        next.count_work();
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            most,
+            "a list is cut after so many dispatches (VICTORY_CUT_DISPATCHES), each part a submission of its own"
+        );
+    });
 }
 
 /// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
@@ -1604,11 +1663,13 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        super::cut_after_dispatches(this);
         with_state(this, |list, s| s.dispatch(list, x, y, z, false));
     }
     /// A dispatch whose `x` counts threads.
     pub(super) extern "system" fn dispatch_threads(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        super::cut_after_dispatches(this);
         with_state(this, |list, s| s.dispatch(list, x, y, z, true));
     }
     /// The groups a mesh dispatch of `x` × `y` × `z` groups runs: the
@@ -1763,7 +1824,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        if kind != DISPATCH {
+        if kind == DISPATCH {
+            cut_after_dispatches(this);
+        } else {
             hoist(this);
         }
         with_state(this, |list, s| {
@@ -2108,6 +2171,54 @@ mod tests {
             assert!(parts[1].unmet().is_empty());
             crate::host::host().unwrap().execute(&[&*parts[1]]);
         }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A list is cut, without a wait, before the dispatch past
+    /// `VICTORY_CUT_DISPATCHES`; the part after counts the work before it,
+    /// so a wait after its writes cuts again and they stay behind that work.
+    #[cfg(windows)]
+    #[test]
+    fn lists_are_cut_after_so_many_dispatches() {
+        let most = dispatches_per_part();
+        if crate::host::host().is_none() || most == 0 {
+            return;
+        }
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
+        // Memory the list's wait and write reach through addresses: atomics,
+        // for the compiler to know that it changes behind its back.
+        let memory = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+        let at = |i: usize| memory[i].as_ptr() as u64;
+        // As if the host had recorded that many of the title's dispatches.
+        for _ in 0..most - 1 {
+            host_list(list).unwrap().count_dispatch();
+        }
+        // One short: not cut (the dispatch itself is dropped: no pipeline).
+        state::dispatch(list, 1, 1, 1);
+        assert_eq!(submitted(list).len(), 1);
+        host_list(list).unwrap().count_dispatch();
+        state::dispatch(list, 1, 1, 1);
+        assert_eq!(submitted(list).len(), 2);
+        assert!(host_list(list).unwrap().worked());
+        assert_eq!(host_list(list).unwrap().dispatches(), 0);
+        write64(list, at(0), 1, 0, 0);
+        wait_value(list, at(1), 7, 4);
+        assert_eq!(submitted(list).len(), 3);
+        assert_eq!(close(list), S_OK);
+        let parts = submitted(list);
+        assert!(parts[0].unmet().is_empty() && parts[1].unmet().is_empty());
+        assert_eq!(parts[2].unmet().len(), 1);
+        crate::host::host().unwrap().execute(&[&*parts[0], &*parts[1]]);
+        assert_eq!(memory[0].load(std::sync::atomic::Ordering::SeqCst), 1);
+        memory[1].store(4, std::sync::atomic::Ordering::SeqCst);
+        assert!(parts[2].unmet().is_empty());
+        crate::host::host().unwrap().execute(&[&*parts[2]]);
+        drop(parts);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

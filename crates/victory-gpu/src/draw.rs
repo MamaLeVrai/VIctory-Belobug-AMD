@@ -1089,6 +1089,7 @@ impl State {
         }
         list.count_write();
         list.count_work();
+        list.count_dispatch();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         // Depth textures it wrote as images get what it wrote; then the
         // title's state goes back on the list.
@@ -1955,6 +1956,7 @@ impl State {
         if kind == DISPATCH {
             list.count_write();
             list.count_work();
+            list.count_dispatch();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             let lit = self.ambient(list, p);
             if crate::twin::resolve(list) | lit {

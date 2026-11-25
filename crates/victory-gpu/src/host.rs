@@ -70,6 +70,43 @@ fn async_submit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_none_or(|v| v != "0"))
 }
 
+/// Whether each run of a submission (a host list with its prelude) goes to
+/// the queue in an `ExecuteCommandLists` of its own, as since the world
+/// hung on an RX 7600 in a submission of 30 lists (DXGI_ERROR_DEVICE_HUNG);
+/// `VICTORY_SUBMIT_EACH=0`: one call for all the runs. The system takes the
+/// card back only between the packets it is given (an RX 6600 XT reports
+/// compute preemption at DMA-buffer boundaries only, [`log_preemption`],
+/// ZSlayerHQ/victory-world-runtime#10), and one that runs past the timeout
+/// (2 s) resets the driver.
+fn submit_each() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_EACH").is_none_or(|v| v != "0"))
+}
+
+/// The ranges of a submission's `count` lists that go to the queue in one
+/// call each: all of them, or (`each`) one per run starting at `firsts`
+/// (lists before the first start join the first run; starts past the end
+/// or repeated are ignored).
+fn submission_pieces(count: usize, firsts: &[usize], each: bool) -> Vec<(usize, usize)> {
+    let mut starts: Vec<usize> = if each {
+        firsts.iter().copied().filter(|&f| f > 0 && f < count).collect()
+    } else {
+        Vec::new()
+    };
+    starts.sort_unstable();
+    starts.dedup();
+    let mut pieces = Vec::with_capacity(starts.len() + 1);
+    let mut from = 0;
+    for start in starts {
+        pieces.push((from, start));
+        from = start;
+    }
+    if from < count {
+        pieces.push((from, count));
+    }
+    pieces
+}
+
 /// Microseconds spent bringing buffer copies up to date while the
 /// submission before ran ([`Host::prewarm`]), since the last frame line.
 static PREWARM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -260,6 +297,29 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 /// behaves as before: nothing executes).
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
+/// Logs how finely the system can take the card from a submission. With
+/// DMA-buffer preemption a submission runs to its end once it has started,
+/// and one that runs past the system's timeout (2 s) resets the driver
+/// ([`submit_each`], `crate::list`'s cuts after so many dispatches).
+fn log_preemption(device: &ID3D12Device) {
+    // SAFETY: plain DXGI queries on a live device.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()) else {
+            return;
+        };
+        if let Ok(desc) = adapter.GetDesc2() {
+            tracing::info!(
+                graphics = desc.GraphicsPreemptionGranularity.0,
+                compute = desc.ComputePreemptionGranularity.0,
+                "host adapter preemption (graphics 0 = DMA buffer, 1 primitive, 2 triangle, 3 pixel, 4 instruction; compute 0 = DMA buffer, 1 dispatch, 2 thread group, 3 thread, 4 instruction)"
+            );
+        }
+    }
+}
+
 /// The host GPU's memory use as its driver reports it, `[(used, budget)]`
 /// in video memory and in system memory; `None` before the device is
 /// made (asking does not make it).
@@ -372,6 +432,7 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        log_preemption(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -551,6 +612,19 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn submission_pieces_one_call_per_run() {
+        use super::submission_pieces;
+        // Three runs (prelude and list, list, prelude and list).
+        assert_eq!(submission_pieces(5, &[0, 2, 3], true), vec![(0, 2), (2, 3), (3, 5)]);
+        assert_eq!(submission_pieces(5, &[0, 2, 3], false), vec![(0, 5)]);
+        assert_eq!(submission_pieces(1, &[0], true), vec![(0, 1)]);
+        assert_eq!(submission_pieces(0, &[], true), Vec::<(usize, usize)>::new());
+        assert_eq!(submission_pieces(0, &[], false), Vec::<(usize, usize)>::new());
+        // Starts past the end or repeated are ignored.
+        assert_eq!(submission_pieces(3, &[0, 1, 1, 7], true), vec![(0, 1), (1, 3)]);
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -697,6 +771,9 @@ pub(crate) struct HostList {
     /// Dispatches and buffer copies recorded since the reset: what may have
     /// written indirect arguments (`crate::indirect` clamps hoisted before).
     writes: std::sync::atomic::AtomicU64,
+    /// The title's dispatches (direct and indirect) recorded since the
+    /// reset: `crate::list` cuts the recording after so many.
+    dispatches: AtomicU32,
     /// Buffers for clamped indirect arguments when this list holds the
     /// clamps of the list after it (`clamp_room`).
     clamp_chunks: Mutex<ClampChunks>,
@@ -1116,6 +1193,7 @@ impl Host {
                 kept: Mutex::default(),
                 work: Mutex::default(),
                 writes: Default::default(),
+                dispatches: AtomicU32::new(0),
                 clamp_chunks: Mutex::default(),
                 pipelines: Mutex::default(),
                 queries: Mutex::default(),
@@ -1367,21 +1445,21 @@ impl Host {
                 (None, None, None)
             };
         let prepared = std::time::Instant::now();
-        // Each run (prelude and list) is a submission of its own: the host
-        // resets the device when one submission runs for about 2 s, and
-        // the world's frames (a second or more over dozens of lists) fit
-        // that only list by list. One wait at the end; with
-        // `VICTORY_GPU_TIMING` (diagnostics) each run is waited for and
-        // timed on its own.
-        let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
-            .iter()
-            .zip(firsts.iter().skip(1).chain([&lists.len()]))
-            .map(|(&a, &b)| &lists[a..b])
-            .collect();
+        // Each run (prelude and list) is a submission of its own
+        // ([`submit_each`]): the host resets the device when one submission
+        // runs for about 2 s, and the world's frames (a second or more over
+        // dozens of lists) fit that only list by list. One wait at the end;
+        // with `VICTORY_GPU_TIMING` (diagnostics) each run is waited for and
+        // timed on its own, whatever the switch.
         #[cfg(feature = "diagnostics")]
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
+        let groups: Vec<&[Option<ID3D12CommandList>]> =
+            submission_pieces(lists.len(), &firsts, each || submit_each())
+                .into_iter()
+                .map(|(a, b)| &lists[a..b])
+                .collect();
         let can_async = !cfg!(test)
             && keep.is_some()
             && !each
@@ -2008,6 +2086,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         *self.work.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         self.writes.store(0, Ordering::Relaxed);
+        self.dispatches.store(0, Ordering::Relaxed);
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
             chunks.used = 0;
@@ -2391,6 +2470,16 @@ impl HostList {
     /// Dispatches and copies since the reset.
     pub(crate) fn writes(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Counts one more of the title's dispatches recorded in the list.
+    pub(crate) fn count_dispatch(&self) {
+        self.dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The title's dispatches recorded in the list since the reset.
+    pub(crate) fn dispatches(&self) -> u32 {
+        self.dispatches.load(Ordering::Relaxed)
     }
 
     /// Room for `bytes` of clamped indirect arguments in this list's
