@@ -1796,3 +1796,56 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
     }
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
 }
+
+/// The divergent-loop scalar fixtures emitted for a host that runs the
+/// console wave whole (64 lanes), and run on the card when it does.
+fn whole_wave_scalar_probe(body: &[u32], expected: u32) {
+    let native = scalar_loop_program(body, true, 64);
+    let p = crate::spill::build(&native).expect("IR");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("GPU SKIP: no hardware device");
+        return;
+    };
+    let Some((wave, _)) = host.translation_caps() else { return };
+    if wave < 64 {
+        eprintln!("GPU SKIP: the host does not run 64-lane waves");
+        return;
+    }
+    let shader = emit_scalar_loop(&native, &p, 64).expect("emission for a 64-lane host");
+    // One host wave of the console's 64 lanes: the latches' votes are wave-wide.
+    assert_eq!(scalar_loop_wave_range(&shader), (64, 64), "WaveSize(64)");
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    assert_eq!(&out[0][..64], &[expected; 64][..], "scalar read after the loop");
+}
+
+#[test]
+fn whole_wave_divergent_scalar_loop() {
+    whole_wave_scalar_probe(&[
+        0x7E14_0300, 0x4A02_0081, 0xBE82_0480, 0xBE86_0380, 0x8106_8106, 0x4E02_0281,
+        0x7D84_0280, 0x8882_026A, 0x8AFE_027E, 0xBF89_FFFA, 0x88FE_027E, 0x7E00_0206,
+    ], 64);
+}
+
+#[test]
+fn whole_wave_nested_divergent_scalar_loops() {
+    whole_wave_scalar_probe(&[
+        0x7E14_0300, 0x3602_0083, 0x4A02_0281, 0x2C08_0084, 0x4A08_0881, 0xBE86_0380,
+        0xBE82_0480, 0xBE8C_0480, 0x7E06_0304, 0x8106_8106, 0x4E06_0681, 0x7D84_0680,
+        0x888C_0C6A, 0x8AFE_0C7E, 0xBF89_FFFA, 0x88FE_0C7E, 0x4E02_0281, 0x7D84_0280,
+        0x8882_026A, 0x8AFE_027E, 0xBF89_FFF2, 0x88FE_027E, 0x7E00_0206,
+    ], 16);
+}
