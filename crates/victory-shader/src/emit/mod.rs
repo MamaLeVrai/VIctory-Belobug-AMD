@@ -472,10 +472,11 @@ pub fn emit(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     // On a host that runs the console wave whole (64 lanes) the group is one
-    // host wave: the latches taken by the whole wave need no group vote.
+    // host wave: the latches taken by the whole wave need no group vote. A
+    // console wave32 program is declared WaveSize(32) on either host, so each
+    // console wave is one host wave and votes on its own.
     let whole_wave = lower::host_max_wave() >= 64;
-    if native.wave64
-        && (lower::host_max_wave() == 32 || whole_wave)
+    if (lower::host_max_wave() == 32 || whole_wave)
         && st.wide.is_empty()
         && matches!(native.io, crate::native::StageIo::Cs(cs)
             if cs.threads.iter().product::<u32>() == 64 && cs.lds_bytes() == 0)
@@ -484,7 +485,7 @@ pub fn emit(
     {
         let wide = lower::scalar_loop_latches(p, st);
         if !wide.is_empty() {
-            if !whole_wave && group_sync() == 0 {
+            if native.wave64 && !whole_wave && group_sync() == 0 {
                 return Err(ShaderError::Unsupported {
                     offset: 0,
                     what: "a divergent loop's scalar result without group synchronization",

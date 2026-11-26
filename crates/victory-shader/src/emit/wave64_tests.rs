@@ -1849,3 +1849,59 @@ fn whole_wave_nested_divergent_scalar_loops() {
         0x8882_026A, 0x8AFE_027E, 0xBF89_FFF2, 0x88FE_027E, 0x7E00_0206,
     ], 16);
 }
+
+/// A console wave32 program over a group of 64, each lane leaving the loop at
+/// its own iteration: on the console each wave counts its own iterations, 32
+/// in lanes 0..31 and 64 in lanes 32..63. Each console wave is one host wave,
+/// declared WaveSize(32), on hosts of 32 and of 64 lanes alike: both
+/// emissions run on the card (WaveSize(32) runs on RDNA too).
+#[test]
+fn wave32_divergent_scalar_loop() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE82_0380, // s_mov_b32 s2, 0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x8106_8106, // loop: s_add_u32 s6, s6, 1
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+        0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+        0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+        0x7E00_0206, // v_mov_b32 v0, s6
+    ];
+    let native = scalar_loop_program(&body, false, 64);
+    let p = crate::spill::build(&native).expect("IR");
+    let shaders = [32, 64].map(|wave| emit_scalar_loop(&native, &p, wave).expect("emission"));
+    let ranges = shaders.each_ref().map(scalar_loop_wave_range);
+    eprintln!("PSV0 wave ranges for hosts of 32 and 64 lanes: {ranges:?}");
+    let want: Vec<u32> = (0..64).map(|t| if t < 32 { 32 } else { 64 }).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("GPU SKIP: no hardware device");
+        assert_eq!(ranges, [(32, 32); 2], "WaveSize(32)");
+        return;
+    };
+    let mut got = Vec::new();
+    for shader in &shaders {
+        let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        eprintln!("GPU readback: {:?}", &out[0][..64]);
+        got.push(out[0][..64].to_vec());
+    }
+    assert_eq!(ranges, [(32, 32); 2], "WaveSize(32)");
+    assert_eq!(got, [want.clone(), want], "each console wave's count after the loop");
+}
