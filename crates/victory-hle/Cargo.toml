@@ -37,6 +37,8 @@ windows-sys = { workspace = true, features = [
 ] }
 windows = { workspace = true, features = [
     "Win32_Graphics_Direct3D12",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
     "Win32_Graphics_Dxgi_Common",
 ] }
 # `#[implement]` names it.

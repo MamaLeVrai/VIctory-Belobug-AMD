@@ -941,7 +941,53 @@ pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
     });
     // SAFETY: checked non-null.
     unsafe { out.write(Box::into_raw(acp)) };
+    #[cfg(windows)]
+    warn_without_output();
     S_OK
+}
+
+/// Says so, once, when Windows has no default audio output. The title's
+/// audio leaves through the host's WASAPI (see the top of the file); with no
+/// output its middleware never starts mixing, and story loading was seen to
+/// wait on the loading screen for good (#334). Asked on a thread of ours: COM
+/// is set up there, not on the title's.
+#[cfg(windows)]
+fn warn_without_output() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-audio-check".into()).spawn(|| {
+            if audio_output() == Some(false) {
+                tracing::warn!("no audio output device: the title's sound has nowhere to go, and story loading may wait for it for good (#334); turn an output on");
+                eprintln!("VIctory: no audio output device is active; the title may stay on its loading screen. Turn an audio output on (speakers, headphones or a virtual one).");
+            }
+        });
+    });
+}
+
+/// Whether Windows has a default audio output (a render endpoint);
+/// `None` when it cannot be asked.
+#[cfg(windows)]
+fn audio_output() -> Option<bool> {
+    use windows::Win32::Media::Audio::{
+        IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
+    };
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    };
+    /// `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`: no endpoint of that kind.
+    const NOT_FOUND: HRESULT = 0x8007_0490_u32 as i32;
+    // SAFETY: plain COM calls on this thread, which joins the process's
+    // multithreaded apartment (an error if it is in another one is harmless).
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let devices: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        match devices.GetDefaultAudioEndpoint(eRender, eConsole) {
+            Ok(_) => Some(true),
+            Err(e) if e.code().0 == NOT_FOUND => Some(false),
+            Err(_) => None,
+        }
+    }
 }
 
 pub(crate) fn module() -> HleModule {
@@ -965,6 +1011,16 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows answers whether it has an audio output, on a thread of ours
+    /// as `AcpHalCreate` asks (the answer depends on the machine).
+    #[cfg(windows)]
+    #[test]
+    fn the_audio_output_can_be_asked_for() {
+        let answer = std::thread::spawn(audio_output).join().unwrap();
+        assert!(answer.is_some(), "the audio endpoint query failed");
+        eprintln!("audio output present: {answer:?}");
+    }
 
     #[test]
     fn heap_maps_every_byte_of_a_block() {
