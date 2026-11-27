@@ -672,6 +672,17 @@ mod late {
     }
 
     /// Whether the title was found writing a page of `[from, to)` late.
+    /// Test only: forgets every learned page, and takes turns with the other
+    /// tests that learn them (the set is one for the process, and an address
+    /// freed by one test is handed to the next).
+    #[cfg(test)]
+    pub(super) fn fresh_for_test() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: Mutex<()> = Mutex::new(());
+        let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        *PAGES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        turn
+    }
+
     pub(super) fn written(from: usize, to: usize) -> bool {
         let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
         pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains(&page)))
@@ -1176,6 +1187,7 @@ mod tests {
     /// one left alone is not.
     #[test]
     fn places_written_after_sending_are_learned() {
+        let _turn = late::fresh_for_test();
         // Two pages of memory of our own, page-aligned, as title memory.
         let memory = vec![0u8; 4 * 4096];
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
@@ -1199,6 +1211,7 @@ mod tests {
     /// again before landing, is learned; one that still matches is not.
     #[test]
     fn fills_done_on_the_cpu_are_learned_too() {
+        let _turn = late::fresh_for_test();
         let memory = vec![0u8; 4 * 4096];
         let page = (memory.as_ptr() as usize).next_multiple_of(4096);
         let (kept, changed) = (page + 16, page + 4096 + 0xbd0);
