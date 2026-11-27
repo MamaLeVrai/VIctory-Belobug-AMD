@@ -5318,17 +5318,47 @@ mod many_askers_tests {
         std::thread::scope(|s| {
             if VIEWS > 1 {
                 s.spawn(move || {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
                     super::REST_IN_TEST.set(rest);
                     super::PORT_GUARD_IN_TEST.set(port == 1);
                     let mut last = [0u64; VIEWS];
+                    // The view comes and goes in a placeholder of its own,
+                    // which stays: unmapped while its change is under way, a
+                    // plain view's address could be another test's memory
+                    // before the change is done, left alone (never guarded)
+                    // until then.
+                    // SAFETY: a reservation of our own.
+                    let hole = unsafe {
+                        VirtualAlloc2(
+                            GetCurrentProcess(),
+                            std::ptr::null(),
+                            PAGE,
+                            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                            PAGE_NOACCESS,
+                            std::ptr::null_mut(),
+                            0,
+                        ) as usize
+                    };
+                    assert_ne!(hole, 0);
                     for round in 0..300usize {
                         let (page, asked) = (round * 5 % PAGES, round % VIEWS);
                         // SAFETY (all): a view of one page of the section,
                         // this thread's alone.
                         let one = unsafe {
-                            MapViewOfFile(section as _, FILE_MAP_WRITE, 0, (page * PAGE) as u32, PAGE).Value as usize
+                            MapViewOfFile3(
+                                section as _,
+                                GetCurrentProcess(),
+                                hole as *const _,
+                                (page * PAGE) as u64,
+                                PAGE,
+                                MEM_REPLACE_PLACEHOLDER,
+                                PAGE_READWRITE,
+                                std::ptr::null_mut(),
+                                0,
+                            )
+                            .Value as usize
                         };
-                        assert_ne!(one, 0);
+                        assert_eq!(one, hole);
                         super::title_memory_remapped(one, PAGE);
                         crate::title_memory_view(one, PAGE, section, (page * PAGE) as u64);
                         unsafe { ((one + THREADS * 8) as *mut u64).write_volatile(round as u64) };
@@ -5340,7 +5370,13 @@ mod many_askers_tests {
                         {
                             let _changing = super::title_memory_remapping();
                             super::title_memory_unmapping(one, PAGE);
-                            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ }) };
+                            unsafe {
+                                UnmapViewOfFile2(
+                                    GetCurrentProcess(),
+                                    MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ },
+                                    MEM_PRESERVE_PLACEHOLDER,
+                                )
+                            };
                         }
                         last = [last[asked]; VIEWS];
                     }
