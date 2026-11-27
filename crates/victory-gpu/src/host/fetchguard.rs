@@ -81,6 +81,15 @@ impl Drop for Writes {
     }
 }
 
+/// Whether the guard is on (`VICTORY_RELAY_FETCH_GUARD=1`; off by default).
+/// Measured on an RX 7900 XT it cost ~0.7 ms of fetch wait a frame and more
+/// stalls before the title's first list call, for an overlap no game run has
+/// been shown to suffer from (#428): on for whoever sees the wrong data.
+pub(super) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_FETCH_GUARD").is_some_and(|v| v == "1"))
+}
+
 /// A submission is about to write `copies` on the card: counted, and if a
 /// fetch on the copy queue is reading one of them, `drawing` waits for it
 /// before anything sent to it after this call.

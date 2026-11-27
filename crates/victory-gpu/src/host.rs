@@ -3831,7 +3831,7 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
-        if relay_copy() {
+        if relay_copy() && fetchguard::on() {
             let g: Vec<f64> = fetchguard::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
                 "fetches of card copies' pieces per frame (VICTORY_RELAY_COPY=1): {:.1} on the copy queue, {:.1} on the drawing \
@@ -4522,7 +4522,7 @@ impl Host {
         // With the fetch on the copy queue: counted before anything of this
         // submission goes to the drawing queue, which waits here for a fetch
         // reading one of these copies ([`fetchguard`]).
-        let writes = (relay() && relay_copy()).then(|| {
+        let writes = (relay() && relay_copy() && fetchguard::on()).then(|| {
             let copies = declared.iter().map(|d| d.0.id()).chain(looked.iter().map(|l| l.0.id())).chain(dirty.iter().map(|d| d.0.id()));
             fetchguard::writing(&self.queue, copies.collect())
         });
@@ -4959,12 +4959,13 @@ impl Host {
         let copying = !pieces.is_empty()
             && fetch.as_mut().is_some_and(|f| {
                 f.queue.is_some()
-                    && fetchguard::may_copy(
+                    && (!fetchguard::on()
+                        || fetchguard::may_copy(
                         pieces.iter().map(|p| p.0.id()),
                         plans.iter().filter_map(|p| p.0.writes.as_ref()),
                         &f.fence,
                         f.sent + 1,
-                    )
+                    ))
             });
         // On the copy queue a later flight may be at a piece while it is
         // fetched (not since `fetchguard`, unless it writes what it did not

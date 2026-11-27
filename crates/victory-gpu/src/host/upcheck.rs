@@ -808,7 +808,7 @@ mod tests {
     /// air at the same copy is fetched on the drawing queue, behind it, and
     /// comes back as that flight left it, never from the middle of it.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_RELAY_FETCH_GUARD=1 and a process of its own"]
     fn a_fetch_never_runs_beside_a_flight_that_writes_its_copy() {
         let Some(host) = host() else {
             return;
