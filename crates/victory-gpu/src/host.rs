@@ -4519,12 +4519,28 @@ impl Host {
                 }
             }
         }
-        // With the fetch on the copy queue: counted before anything of this
-        // submission goes to the drawing queue, which waits here for a fetch
-        // reading one of these copies ([`fetchguard`]).
+        // With the fetch on the copy queue: the bytes this submission writes
+        // are counted before anything of it goes to the drawing queue, which
+        // waits here for a fetch reading one of them ([`fetchguard`]). The
+        // declared ranges (title addresses, as offsets); the sends, widened
+        // to 16 bytes (a word of pairs may reach past a range's end); of a
+        // copy looked at, all of it (a shader may write through a view
+        // nobody declared, anywhere in it).
         let writes = (relay() && relay_copy() && fetchguard::on()).then(|| {
-            let copies = declared.iter().map(|d| d.0.id()).chain(looked.iter().map(|l| l.0.id())).chain(dirty.iter().map(|d| d.0.id()));
-            fetchguard::writing(&self.queue, copies.collect())
+            let offsets = |shadow: &crate::shadow::Shadow, ranges: &[(usize, usize)]| {
+                let (start, len) = shadow.span();
+                let (start, end) = (start as usize, (start + len) as usize);
+                let spans = ranges.iter().map(|&(a, b)| (a.clamp(start, end) - start, b.clamp(start, end) - start)).collect();
+                (shadow.id(), spans)
+            };
+            let ranges = declared
+                .iter()
+                .map(|(shadow, ranges)| offsets(shadow, ranges))
+                .chain(looked.iter().map(|l| (l.0.id(), vec![fetchguard::WHOLE])))
+                .chain(dirty.iter().map(|(shadow, ranges)| {
+                    (shadow.id(), ranges.iter().map(|&(a, b)| (a & !15, b.next_multiple_of(16))).collect())
+                }));
+            fetchguard::writing(&self.queue, ranges.collect())
         });
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
@@ -4961,14 +4977,18 @@ impl Host {
                 f.queue.is_some()
                     && (!fetchguard::on()
                         || fetchguard::may_copy(
-                        pieces.iter().map(|p| p.0.id()),
+                        // (With the check the pieces come down whole.)
+                        pieces.iter().map(|(shadow, lo, hi, _)| {
+                            let (lo, hi) = if torn::on() { shadow.card_hashed(shadow.card_piece_of(*lo)) } else { (*lo, *hi) };
+                            (shadow.id(), lo, hi)
+                        }),
                         plans.iter().filter_map(|p| p.0.writes.as_ref()),
                         &f.fence,
                         f.sent + 1,
                     ))
             });
         // On the copy queue a later flight may be at a piece while it is
-        // fetched (not since `fetchguard`, unless it writes what it did not
+        // fetched (not with `fetchguard`, unless it writes what it did not
         // declare): the pieces come down whole, to be hashed.
         let check = (torn::on() && copying)
             .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
