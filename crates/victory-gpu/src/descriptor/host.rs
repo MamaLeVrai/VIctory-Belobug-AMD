@@ -6104,7 +6104,7 @@ mod tests {
     /// list executes", not while it is in the air), so the flip waits until
     /// the submissions begun when it was queued have finished.
     #[test]
-    fn a_slot_flipped_ahead_changes_under_a_list_in_the_air() {
+    fn a_slot_flip_waits_for_a_reader_submitted_after_it_was_queued() {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
@@ -6197,6 +6197,24 @@ void main() {
             let late = Some(crate::frame::current());
             let heap_at = std::ptr::from_ref(&heap) as usize;
             queue_flip_ahead(heap_at, index, handle, key, late, 0);
+            // Another reader starts after the flip took its submission
+            // snapshot, but before that snapshot has finished.
+            let later_allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let later_list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &later_allocator, None).unwrap();
+            later_list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            later_list.SetComputeRootSignature(&root);
+            later_list.SetPipelineState(&pso);
+            later_list.SetComputeRootDescriptorTable(0, table);
+            later_list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            later_list.Dispatch(1, 1, 1);
+            later_list.Close().unwrap();
+            let later_sent = crate::host::test_begin_submission();
+            let later_finish = Finish(later_sent);
+            let later_gate: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&later_gate, 1).unwrap();
+            queue.ExecuteCommandLists(&[Some(later_list.cast().unwrap())]);
+            queue.Signal(&done, 2).unwrap();
             heap.texture_slots_flip();
             let flipped = heap.made.get(index) == Some(key);
             // (A failing run does not leave the submission begun for ever.)
@@ -6219,7 +6237,17 @@ void main() {
             assert_ne!(heap.made.get(index), Some(key), "not shown while a submission sent before is not finished");
             drop(_finish);
             heap.texture_slots_flip();
-            assert_eq!(heap.made.get(index), Some(key), "shown once nothing reads the slot");
+            let flipped_under_later = heap.made.get(index) == Some(key);
+            // Release the second reader before asserting, so a failure
+            // does not leave a queue waiting forever.
+            later_gate.Signal(1).unwrap();
+            done.SetEventOnCompletion(2, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+            let later_read = [data.cast::<u32>().read_volatile(), data.cast::<u32>().add(1).read_volatile()];
+            drop(later_finish);
+            windows::Win32::Foundation::CloseHandle(event).unwrap();
+            assert!(device.GetDeviceRemovedReason().is_ok());
+            assert_eq!(later_read, [1, 1], "a later submitted reader saw a changed descriptor; flipped under it: {flipped_under_later}");
         }
     }
 }
