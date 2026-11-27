@@ -120,6 +120,13 @@ pub(crate) fn in_flight() -> Option<(u64, u64)> {
     Some((unsafe { fence.0.GetCompletedValue() }, SENT.load(Ordering::Relaxed)))
 }
 
+/// The highest value seen reached on the keep-awake fence before any removal.
+static SEEN: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn seen() -> u64 {
+    SEEN.load(Ordering::Relaxed)
+}
+
 /// Keeps the card of `device` busy while `wanted`.
 pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 'static) -> Option<Awake> {
     let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -203,7 +210,11 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
                 continue;
             }
             // Never more than two on the way.
-            if value >= 2 && fence.GetCompletedValue() + 2 <= value {
+            let done = fence.GetCompletedValue();
+            if done != u64::MAX {
+                SEEN.fetch_max(done, Ordering::Relaxed);
+            }
+            if value >= 2 && done.saturating_add(2) <= value {
                 result = fence.SetEventOnCompletion(value - 1, event);
                 if result.is_ok() {
                     WaitForSingleObject(event, 1000);

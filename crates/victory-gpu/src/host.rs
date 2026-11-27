@@ -714,7 +714,7 @@ pub(crate) fn removal_context() -> String {
     // lock held elsewhere is not waited for (the caller may hold it).
     if let Some(h) = host() {
         // SAFETY: a plain query on a live fence.
-        let completed = unsafe { h.fence.GetCompletedValue() };
+        let completed = reached(unsafe { h.fence.GetCompletedValue() }, DRAWING_SEEN.load(Ordering::Relaxed));
         match h.submitted.try_lock() {
             Ok(sent) => {
                 let _ = write!(text, "; the drawing queue's fence: {completed} of {} signalled", *sent);
@@ -726,14 +726,15 @@ pub(crate) fn removal_context() -> String {
     }
     // Our other queues: the keep-awake compute queue and the relay's copy
     // queue hold work of ours too (`VICTORY_CARD_AWAKE`, `VICTORY_RELAY_COPY`).
-    if let Some((reached, sent)) = awake::in_flight() {
+    if let Some((at, sent)) = awake::in_flight() {
+        let reached = reached(at, awake::seen());
         let _ = write!(text, "; the keep-awake queue's fence: {reached} of {sent} signalled");
     }
     if let Ok(seen) = RELAY_FETCH.try_lock()
         && let Some((fence, sent)) = seen.as_ref()
     {
         // SAFETY: a plain query on a live fence.
-        let reached = unsafe { fence.0.GetCompletedValue() };
+        let reached = reached(unsafe { fence.0.GetCompletedValue() }, 0);
         let _ = write!(text, "; the relay's copy queue fence: {reached} of {sent} signalled");
     }
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
@@ -742,6 +743,20 @@ pub(crate) fn removal_context() -> String {
         let _ = write!(text, "\n  {:.1} ms before, thread {thread}: {what}", ms(*at));
     }
     text
+}
+
+/// The highest value seen reached on the drawing queue's fence before any
+/// removal: once the device is removed every fence reads `u64::MAX`.
+static DRAWING_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A fence value for the report: `now` as read, or, once the device is
+/// removed (`u64::MAX`), the last value seen before (0: none known).
+fn reached(now: u64, seen: u64) -> String {
+    match (now, seen) {
+        (u64::MAX, 0) => "unknown (the device is removed)".into(),
+        (u64::MAX, seen) => format!("{seen} when last seen (the device is removed)"),
+        (now, _) => now.to_string(),
+    }
 }
 
 /// The relay's copy-queue fence and the last value signalled on it, for the
@@ -1215,6 +1230,9 @@ mod tests {
             assert!(super::removal_phase(p, 2).contains("2 submissions of ours not finished"));
         }
         assert_eq!(super::removal_phase(2, 5), "waiting for the card to run a submission");
+        assert_eq!(super::reached(7, 3), "7");
+        assert_eq!(super::reached(u64::MAX, 41), "41 when last seen (the device is removed)");
+        assert_eq!(super::reached(u64::MAX, 0), "unknown (the device is removed)");
     }
 
     /// A list of ours is found by its name, with the debug layer's note or not.
@@ -3686,6 +3704,9 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if completed != u64::MAX {
+                    DRAWING_SEEN.fetch_max(completed, Ordering::Relaxed);
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
