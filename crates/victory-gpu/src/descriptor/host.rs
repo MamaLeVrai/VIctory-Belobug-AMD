@@ -315,8 +315,6 @@ static RESHOWN_AFTER: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// in them says now, and are made from that view when the upload it needs
 /// has run ([`HostHeap::texture_slot_flip`]).
 struct Flip {
-    /// The submission to wait for.
-    after: u64,
     /// The heap (its address), the slot, where its record is and which
     /// record it was.
     heap: usize,
@@ -520,21 +518,37 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
 static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
 
 /// Queues the flip of a slot whose texture's upload ahead of the lists has
-/// run. Lists sent before this moment read the slot by index, recorded
-/// against what it showed (the neutral texture): the flip waits until every
-/// submission begun now has finished, so none of them finds the slot changed
-/// under it (D3D12 allows a table's descriptors to change only until the
-/// list executes). The texture is shown a few frames later, not under a list
-/// in the air.
+/// run. Lists sent before it read the slot by index, recorded against what it
+/// showed (the neutral texture), and so may lists sent after it and before it
+/// is made: D3D12 allows a table's descriptors to change only until the list
+/// executes, not while it is in the air. The flip is made at a moment with
+/// no submission in the air ([`HostHeap::flips_at_rest`]), not once those
+/// begun now have finished: another that began since may read the slot as
+/// well. The texture is shown a few frames later, not under a list in the air.
 fn queue_flip_ahead(heap: usize, index: u32, handle: u64, key: u64, late: Option<u64>, asked: u64) {
-    let after = crate::host::submissions().0;
-    let flip = Flip { after, heap, index, handle, key, late, asked };
+    let flip = Flip { heap, index, handle, key, late, asked };
     FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
 }
 
+/// Whether a slot has waited for a moment with nothing in the air longer than
+/// is wanted: the host makes one ([`crate::host::FLIP_SETTLE_MS`]).
+pub(crate) fn flips_overdue() -> bool {
+    let flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::host::now_ms();
+    flips.iter().any(|f| now > f.asked + crate::host::FLIP_SETTLE_MS)
+}
+
+/// [`HostHeap::flips_at_rest`] of the heap the title writes, for the host's
+/// submission, which holds the lock and has nothing in the air.
+pub(crate) fn flip_held() {
+    if !FLIPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        let _ = super::with_view_heap(HostHeap::flips_at_rest);
+    }
+}
+
 /// Makes the slots whose new texture's upload has run
-/// ([`HostHeap::texture_slots_flip`]); on any thread. Not if the heap is at
-/// something else: the next texture pass does.
+/// ([`HostHeap::texture_slots_flip`]), if nothing is in the air; on any
+/// thread. Not if the heap is at something else: the next texture pass does.
 pub(crate) fn flip_now() {
     let _ = super::with_view_heap(HostHeap::texture_slots_flip);
 }
@@ -2393,8 +2407,8 @@ impl HostHeap {
     }
 
     /// [`HostHeap::texture_slot_show_after`] of a texture whose upload `job`
-    /// makes: shown when that has run and the submissions begun by then have
-    /// finished ([`queue_flip_ahead`]; lists sent before read the slot by index).
+    /// makes: shown when that has run, at a moment with nothing in the air
+    /// ([`queue_flip_ahead`]; lists sent before and after read the slot by index).
     pub(crate) fn texture_slot_show_ahead(&self, job: &crate::texture::ahead::Job, index: u32, handle: u64) {
         if !self.show_later(index, handle) {
             return;
@@ -2427,25 +2441,43 @@ impl HostHeap {
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         let asked = crate::host::now_ms();
         list.defer_host(move || {
-            let after = crate::host::submissions().0;
-            let flip = Flip { after, heap, index, handle, key, late, asked };
+            let flip = Flip { heap, index, handle, key, late, asked };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
 
     /// Makes the slots whose new view's upload has run
-    /// ([`HostHeap::texture_slot_flip`]); returns how many.
+    /// ([`HostHeap::texture_slot_flip`]) if nothing is in the air and no
+    /// submission can begin meanwhile ([`crate::host::when_at_rest`]; or the
+    /// next submission does it, [`flip_held`]); returns how many.
     pub(crate) fn texture_slots_flip(&self) -> usize {
+        if FLIPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return 0;
+        }
+        crate::host::when_at_rest(|| self.flips_at_rest()).unwrap_or(0)
+    }
+
+    /// [`HostHeap::texture_slots_flip`] of a caller that holds the host's
+    /// submission lock with nothing in the air.
+    ///
+    /// A slot is changed only then. A flip does not wait for the submissions
+    /// begun when it was queued, but for all: one begun since reads the slot
+    /// by index too, recorded against the neutral texture (a list's tables
+    /// and the dimension its shader declares are those of what the slot
+    /// showed when it was recorded), and a descriptor written under a list in
+    /// the air is read half written or as what the list did not record.
+    /// There is such a moment at every submission (each settles the ones
+    /// before it, or, with the present sent ahead, one is made
+    /// [`crate::host::FLIP_SETTLE_MS`] after a slot began to wait).
+    pub(crate) fn flips_at_rest(&self) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let finished = crate::host::submissions().1;
         let ready: Vec<Flip> = {
             let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
             if flips.is_empty() {
                 return 0;
             }
             let own = std::ptr::from_ref(self) as usize;
-            let (ready, wait): (Vec<Flip>, Vec<Flip>) =
-                flips.drain(..).partition(|f| f.after <= finished && f.heap == own);
+            let (ready, wait): (Vec<Flip>, Vec<Flip>) = flips.drain(..).partition(|f| f.heap == own);
             *flips = wait;
             ready
         };
@@ -3368,7 +3400,7 @@ impl HostHeap {
                 && !self.sampler
                 && show_new_later()
                 && is_texture_view(&view)
-                && let Some(after) = begun_before(&view)
+                && begun_before(&view).is_some()
             {
                 // Asked again (each draw that reads the slot, each pass)
                 // while it waits: nothing more to do.
@@ -3394,7 +3426,7 @@ impl HostHeap {
                     self.keep(index, kept);
                 }
                 let late = Some(crate::frame::current());
-                let flip = Flip { after, heap: std::ptr::from_ref(self) as usize, index, handle, key, late, asked: crate::host::now_ms() };
+                let flip = Flip { heap: std::ptr::from_ref(self) as usize, index, handle, key, late, asked: crate::host::now_ms() };
                 FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
                 NEW_LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(held);
@@ -6102,9 +6134,37 @@ mod tests {
     /// against the neutral texture (1x1): the slot must not change under it
     /// (a table declared DESCRIPTORS_VOLATILE may change "until the command
     /// list executes", not while it is in the air), so the flip waits until
-    /// the submissions begun when it was queued have finished.
+    /// nothing is in the air.
+    #[test]
+    fn a_slot_flipped_ahead_changes_under_a_list_in_the_air() {
+        a_slot_flip_under_readers(false);
+    }
+
+    /// The same with a second reader, submitted after the flip was queued
+    /// and before the first has finished: the slot is still not made while
+    /// that one is in the air (a flip that waits only for the submissions
+    /// begun when it was queued is made under it), and is made when it has
+    /// finished.
     #[test]
     fn a_slot_flip_waits_for_a_reader_submitted_after_it_was_queued() {
+        a_slot_flip_under_readers(true);
+    }
+
+    /// [`HostHeap::texture_slots_flip`] until the slot shows the record at
+    /// `key`, as long as other tests' submissions (one process, one count of
+    /// submissions) are in the air.
+    fn flipped_when_at_rest(heap: &HostHeap, index: u32, key: u64) -> bool {
+        for _ in 0..500 {
+            heap.texture_slots_flip();
+            if heap.made.get(index) == Some(key) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn a_slot_flip_under_readers(later_reader: bool) {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
@@ -6197,24 +6257,26 @@ void main() {
             let late = Some(crate::frame::current());
             let heap_at = std::ptr::from_ref(&heap) as usize;
             queue_flip_ahead(heap_at, index, handle, key, late, 0);
-            // Another reader starts after the flip took its submission
-            // snapshot, but before that snapshot has finished.
-            let later_allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-            let later_list: ID3D12GraphicsCommandList =
-                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &later_allocator, None).unwrap();
-            later_list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
-            later_list.SetComputeRootSignature(&root);
-            later_list.SetPipelineState(&pso);
-            later_list.SetComputeRootDescriptorTable(0, table);
-            later_list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
-            later_list.Dispatch(1, 1, 1);
-            later_list.Close().unwrap();
-            let later_sent = crate::host::test_begin_submission();
-            let later_finish = Finish(later_sent);
-            let later_gate: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-            queue.Wait(&later_gate, 1).unwrap();
-            queue.ExecuteCommandLists(&[Some(later_list.cast().unwrap())]);
-            queue.Signal(&done, 2).unwrap();
+            // Another reader starts after the flip was queued, but before
+            // the first submission has finished.
+            let later = later_reader.then(|| {
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList =
+                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pso);
+                list.SetComputeRootDescriptorTable(0, table);
+                list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                list.Dispatch(1, 1, 1);
+                list.Close().unwrap();
+                let finish = Finish(crate::host::test_begin_submission());
+                let gate: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                queue.Wait(&gate, 1).unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                queue.Signal(&done, 2).unwrap();
+                (finish, gate, allocator, list)
+            });
             heap.texture_slots_flip();
             let flipped = heap.made.get(index) == Some(key);
             // (A failing run does not leave the submission begun for ever.)
@@ -6236,18 +6298,23 @@ void main() {
             heap.texture_slots_flip();
             assert_ne!(heap.made.get(index), Some(key), "not shown while a submission sent before is not finished");
             drop(_finish);
+            // (With the second reader the flip waits for it as well.)
             heap.texture_slots_flip();
             let flipped_under_later = heap.made.get(index) == Some(key);
-            // Release the second reader before asserting, so a failure
-            // does not leave a queue waiting forever.
-            later_gate.Signal(1).unwrap();
-            done.SetEventOnCompletion(2, event).unwrap();
-            WaitForSingleObject(event, INFINITE);
-            let later_read = [data.cast::<u32>().read_volatile(), data.cast::<u32>().add(1).read_volatile()];
-            drop(later_finish);
+            if let Some((finish, gate, _allocator, _list)) = later {
+                // Release the second reader before asserting, so a failure
+                // does not leave a queue waiting forever.
+                gate.Signal(1).unwrap();
+                done.SetEventOnCompletion(2, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+                let later_read = [data.cast::<u32>().read_volatile(), data.cast::<u32>().add(1).read_volatile()];
+                drop(finish);
+                assert!(device.GetDeviceRemovedReason().is_ok());
+                assert_eq!(later_read, [1, 1], "a later submitted reader saw a changed descriptor; flipped under it: {flipped_under_later}");
+            }
             windows::Win32::Foundation::CloseHandle(event).unwrap();
-            assert!(device.GetDeviceRemovedReason().is_ok());
-            assert_eq!(later_read, [1, 1], "a later submitted reader saw a changed descriptor; flipped under it: {flipped_under_later}");
+            // And it is shown once nothing is in the air: not for ever grey.
+            assert!(flipped_when_at_rest(&heap, index, key), "shown once nothing reads the slot");
         }
     }
 }

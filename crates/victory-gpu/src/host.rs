@@ -92,6 +92,10 @@ fn retired() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(u64, 
     RETIRED[part].lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// How long slots wait for a moment with nothing in the air, with the
+/// present sent ahead, before one is made for them ([`late_free_present`]).
+pub(crate) const FLIP_SETTLE_MS: u64 = 250;
+
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -570,6 +574,30 @@ fn sweep() {
 /// before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
+}
+
+/// Whether no submission is in the air: every one begun has finished.
+pub(crate) fn at_rest() -> bool {
+    let (begun, finished) = submissions();
+    finished >= begun
+}
+
+/// Runs `f` at a moment with nothing in the air that nothing can begin
+/// under: the submission lock is taken (without waiting: `None` if another
+/// thread holds it, or this one) and every submission begun has finished.
+/// What a list in the air reads by index (a descriptor slot) may be changed
+/// then and only then: a slot changed while a list that was recorded against
+/// what it showed is on the card is read half written, or as what the list
+/// did not expect; and a submission begins only under this lock, so none
+/// starts reading while `f` writes.
+pub(crate) fn when_at_rest<T>(f: impl FnOnce() -> T) -> Option<T> {
+    let host = host()?;
+    let _held = match host.submitted.try_lock() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    at_rest().then(f)
 }
 
 /// A submission begun, as a test's list in the air stands for one (tests).
@@ -5793,15 +5821,25 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present()
+            && now_ms()
+                > SWEPT.load(Ordering::Relaxed) + if crate::descriptor::host::flips_overdue() { FLIP_SETTLE_MS } else { 1500 }
+        {
             // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
+            // with nothing in the air: one is made for the sweep, and sooner
+            // for slots that wait for one to be made from their new texture.
             self.settle(&mut submitted, WHY_SYNC);
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
+        }
+        // The same moment, nothing in the air and the submission lock held:
+        // the slots whose new texture is there are made from it
+        // ([`crate::descriptor::host::flip_held`]).
+        if at_rest() {
+            crate::descriptor::host::flip_held();
         }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
