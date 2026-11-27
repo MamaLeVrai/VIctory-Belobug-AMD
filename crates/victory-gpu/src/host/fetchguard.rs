@@ -67,6 +67,11 @@ static GUARD: Mutex<Option<Guard>> = Mutex::new(None);
 /// to the drawing queue instead, waits of the drawing queue for a fetch.
 pub(super) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Of the fetches sent to the drawing queue, those held back only by a write
+/// of a whole copy (a copy a submission merely looks at: [`WHOLE`]), and
+/// those held back by a write of known bytes. Since the last frame line.
+pub(super) static HELD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Sorted, the empty ones out, those that overlap or touch made one.
 fn joined(mut spans: Vec<Span>) -> Vec<Span> {
     spans.retain(|s| s.0 < s.1);
@@ -190,6 +195,18 @@ pub(super) fn may_copy<'a>(
     });
     if others {
         STATS[1].fetch_add(1, Relaxed);
+        // Whether some write of known bytes meets a piece: else the whole
+        // copy of a submission that merely looks at it held the fetch back.
+        let known = by.iter().any(|(id, spans)| {
+            guard.writers.get(id).is_some_and(|all| {
+                all.iter().any(|(number, written)| {
+                    !ours.contains(number)
+                        && written.iter().all(|w| *w != WHOLE)
+                        && meet(spans, written)
+                })
+            })
+        });
+        HELD[usize::from(known)].fetch_add(1, Relaxed);
         return false;
     }
     guard.fetching = by;

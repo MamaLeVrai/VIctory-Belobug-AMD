@@ -3833,11 +3833,14 @@ fn late_line(frames: f64) {
         );
         if relay_copy() && fetchguard::on() {
             let g: Vec<f64> = fetchguard::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            let h: Vec<f64> = fetchguard::HELD.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
                 "fetches of card copies' pieces per frame (VICTORY_RELAY_COPY=1): {:.1} on the copy queue, {:.1} on the drawing \
-                 queue behind a submission in the air that writes the same copies; {:.1} waits of the drawing queue for a fetch",
+                 queue behind a submission in the air that writes the same copies ({:.1} of them held back only by a copy a                  submission merely looks at, {:.1} by writes of known bytes); {:.1} waits of the drawing queue for a fetch",
                 g[0],
                 g[1],
+                h[0],
+                h[1],
                 g[2],
             );
         }
