@@ -1159,6 +1159,19 @@ pub(crate) fn alone_line(frames: f64) {
     );
 }
 
+/// For tests that ask as a submission does ([`ask_once`] to
+/// [`ask_once_end`]): one at a time, as the runtime's submissions are (under
+/// the host's submission lock). The standing asking is one for the process:
+/// a second submission meanwhile ends it, or takes it up into its own
+/// ([`ask_rest`] takes the ranges out and puts them back with its own), and
+/// the first then finds a range held that no asking after its last write
+/// looked at, and that write unseen.
+#[cfg(test)]
+pub(crate) fn one_submission() -> std::sync::MutexGuard<'static, ()> {
+    static ONE: Mutex<()> = Mutex::new(());
+    ONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
@@ -4339,6 +4352,7 @@ mod tests {
         assert_ne!(p, 0);
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
+        let _one = one_submission();
         ask_ahead(&ranges);
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
@@ -5902,6 +5916,7 @@ mod port7_tests {
                     }
                     let ranges: Vec<(usize, usize)> =
                         (0..4).map(|k| (at + (HALF + k * 6) * PAGE, at + (HALF + k * 6 + 6) * PAGE)).collect();
+                    let one = one_submission();
                     ask_once(&ranges);
                     let told = rng(&mut seed, HALF);
                     // SAFETY: committed memory of ours.
@@ -5919,6 +5934,7 @@ mod port7_tests {
                     }
                     ask_ahead_done();
                     ask_once_end();
+                    drop(one);
                 }
             });
         });

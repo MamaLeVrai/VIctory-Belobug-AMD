@@ -10708,9 +10708,8 @@ mod refresh_tests {
     /// Prepares as a submission does: one asking for all the ranges, the
     /// refreshes in several flushes, the asking's end.
     fn submission(ranges: &[(Arc<Shadow>, usize, usize)], flushes: usize) {
-        // One at a time, as submissions are.
-        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        // One at a time, as submissions are, here and in other tests.
+        let _one = crate::watch::one_submission();
         let asked: Vec<(usize, usize)> = ranges.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.1 + r.2)).collect();
         crate::watch::ask_once(&asked);
         let mut batch = Batch::default();
@@ -11089,6 +11088,8 @@ mod refresh_tests {
             let look = |expected: bool, what: &str| {
                 // The submission's one asking, which takes two ranges. (Again
                 // if a submission of another test ended it.)
+                // One at a time, as submissions are (`one_submission`).
+                let _one = crate::watch::one_submission();
                 let mut known = false;
                 for _ in 0..100 {
                     crate::watch::ask_once(&[(at, at + len), (region + 7 * PAGE, region + 8 * PAGE)]);
