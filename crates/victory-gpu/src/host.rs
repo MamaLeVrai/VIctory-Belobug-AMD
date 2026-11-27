@@ -698,12 +698,8 @@ pub(crate) fn removal_context() -> String {
     use std::fmt::Write;
     let now = now_us();
     let ms = |at: u64| now.saturating_sub(at) as f64 / 1000.0;
-    let phase = match SUBMITTING[0].load(Ordering::Relaxed) {
-        0 => "between submissions (nothing of ours was running on the card)",
-        1 => "preparing a submission (nothing of ours was running on the card)",
-        2 => "waiting for the card to run a submission",
-        _ => "copying back what a submission wrote (nothing of ours was running on the card)",
-    };
+    let (started, finished) = (STARTED.load(Ordering::Relaxed), FINISHED.load(Ordering::Relaxed));
+    let phase = removal_phase(SUBMITTING[0].load(Ordering::Relaxed), started.saturating_sub(finished));
     let mut text = format!(
         "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {} finished {}",
         SUBMITTING[1].load(Ordering::Relaxed),
@@ -711,15 +707,46 @@ pub(crate) fn removal_context() -> String {
         crate::pipeline::library_removal_note(),
         RETIREMENTS[0].load(Ordering::Relaxed),
         RETIREMENTS[1].load(Ordering::Relaxed),
-        STARTED.load(Ordering::Relaxed),
-        FINISHED.load(Ordering::Relaxed),
+        started,
+        finished,
     );
+    // The card's own count of what it ran: the drawing queue's fence. A
+    // lock held elsewhere is not waited for (the caller may hold it).
+    if let Some(h) = host() {
+        // SAFETY: a plain query on a live fence.
+        let completed = unsafe { h.fence.GetCompletedValue() };
+        match h.submitted.try_lock() {
+            Ok(sent) => {
+                let _ = write!(text, "; the drawing queue's fence: {completed} of {} signalled", *sent);
+            }
+            Err(_) => {
+                let _ = write!(text, "; the drawing queue's fence: {completed} reached");
+            }
+        }
+    }
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
         let _ = write!(text, "\n  {:.1} ms before, thread {thread}: {what}", ms(*at));
     }
     text
+}
+
+/// What the submitting thread was doing ([`SUBMITTING`]'s phase) and, where
+/// it was not waiting for the card, whether anything of ours could still be
+/// on it: with flights in the air (`VICTORY_RELAY`) the thread goes on while
+/// `unfinished` submissions run.
+fn removal_phase(phase: u64, unfinished: u64) -> String {
+    let doing = match phase {
+        0 => "between submissions",
+        1 => "preparing a submission",
+        2 => return "waiting for the card to run a submission".into(),
+        _ => "copying back what a submission wrote",
+    };
+    match unfinished {
+        0 => format!("{doing} (nothing of ours was running on the card)"),
+        n => format!("{doing} ({n} submissions of ours not finished: their lists may have been running on the card)"),
+    }
 }
 
 /// Says [`removal_context`] in the log, once: called by whoever finds the
@@ -1157,6 +1184,20 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// The removal report says nothing of ours ran only when every
+    /// submission had finished: with flights in the air the submitting
+    /// thread is between submissions while lists still run.
+    #[test]
+    fn the_removal_phase_counts_unfinished_submissions() {
+        let says_nothing = |p, n| super::removal_phase(p, n).contains("nothing of ours");
+        assert!(says_nothing(0, 0) && says_nothing(1, 0) && says_nothing(3, 0));
+        for p in [0, 1, 3] {
+            assert!(!says_nothing(p, 1));
+            assert!(super::removal_phase(p, 2).contains("2 submissions of ours not finished"));
+        }
+        assert_eq!(super::removal_phase(2, 5), "waiting for the card to run a submission");
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
