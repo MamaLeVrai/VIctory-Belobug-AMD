@@ -5557,8 +5557,17 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let memory = vec![0u64; 1 << 13];
-        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let memory = vec![0u64; 1 << 14];
+        let mut start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // The structured view at 8 below must be off its elements in the
+        // window of title memory that holds it (the loose copy, which begins
+        // on the 4 MiB line below). Where its place in the window is a
+        // multiple of 456 bytes (1 page in 57 of a heap allocation) it is on
+        // them, and takes the window and no copy of its own, as it should:
+        // the next page is off them (4096 is no multiple of 456).
+        if crate::shadow::find(start + 8, 4 * 456).is_some_and(|w| w.offset(start + 8) % 456 == 0) {
+            start += 4096;
+        }
         // SAFETY: a plain CPU-side heap of one view.
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
