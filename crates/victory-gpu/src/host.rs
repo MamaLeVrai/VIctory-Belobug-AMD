@@ -724,6 +724,18 @@ pub(crate) fn removal_context() -> String {
             }
         }
     }
+    // Our other queues: the keep-awake compute queue and the relay's copy
+    // queue hold work of ours too (`VICTORY_CARD_AWAKE`, `VICTORY_RELAY_COPY`).
+    if let Some((reached, sent)) = awake::in_flight() {
+        let _ = write!(text, "; the keep-awake queue's fence: {reached} of {sent} signalled");
+    }
+    if let Ok(seen) = RELAY_FETCH.try_lock()
+        && let Some((fence, sent)) = seen.as_ref()
+    {
+        // SAFETY: a plain query on a live fence.
+        let reached = unsafe { fence.0.GetCompletedValue() };
+        let _ = write!(text, "; the relay's copy queue fence: {reached} of {sent} signalled");
+    }
     let trail = TRAIL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = write!(text, "; the last {} things done, newest last:", trail.len());
     for (at, thread, what) in trail.iter() {
@@ -731,6 +743,13 @@ pub(crate) fn removal_context() -> String {
     }
     text
 }
+
+/// The relay's copy-queue fence and the last value signalled on it, for the
+/// device-removed report.
+struct SendFence(ID3D12Fence);
+// SAFETY: fences are free-threaded; only `GetCompletedValue` is asked.
+unsafe impl Send for SendFence {}
+static RELAY_FETCH: Mutex<Option<(SendFence, u64)>> = Mutex::new(None);
 
 /// What the submitting thread was doing ([`SUBMITTING`]'s phase) and, where
 /// it was not waiting for the card, whether anything of ours could still be
@@ -4857,6 +4876,9 @@ impl Host {
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
+            if queue.is_some() {
+                *RELAY_FETCH.lock().unwrap_or_else(|e| e.into_inner()) = Some((SendFence(fence.clone()), 0));
+            }
             Some(RelayFetch {
                 list,
                 queue,
@@ -5003,6 +5025,11 @@ impl Host {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
         f.sent += 1;
+        if f.queue.is_some()
+            && let Some(seen) = RELAY_FETCH.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        {
+            seen.1 = f.sent;
+        }
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let copy_queue = f.queue.clone();
         let waiting = std::time::Instant::now();
