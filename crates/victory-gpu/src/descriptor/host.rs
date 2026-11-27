@@ -6084,6 +6084,121 @@ mod tests {
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
+
+    /// A slot that shows the neutral texture while the upload of its own
+    /// runs ahead (`texture_slot_show_ahead`) is made from its own when the
+    /// upload has run, `Flip { after: 0 }`: at once, while a submission sent
+    /// before still reads it. That submission, recorded against the neutral
+    /// texture (1x1), reads the new one (4x4) instead: the slot changed under
+    /// a list submitted and not finished, which D3D12 forbids even for a
+    /// table declared DESCRIPTORS_VOLATILE (the descriptors may change "until
+    /// the command list executes", not while it does).
+    #[test]
+    #[ignore = "shows the hazard of slots rewritten under lists in the air; fails until flips wait for them"]
+    fn a_slot_flipped_ahead_changes_under_a_list_in_the_air() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::{Interface, s};
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let device = &host.device;
+        let index = 3u32;
+        // The title's 4x4 texture and its view (format 28, a 2D view of one level).
+        let texture = crate::resource::title_texture_for_test(4, 4, 28).expect("a title texture");
+        let record = [0u64; 4];
+        let handle = record.as_ptr() as u64;
+        let words: [u32; 10] = [28, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+        super::super::create_srv(std::ptr::null(), texture, &words, handle);
+        let key = record_key(handle);
+        let view = view_at(key as u32, (key >> 32) as u32).expect("the view is recorded");
+        // The slot shows the neutral texture until then (`show_later`).
+        {
+            let _made = heap.made.lock(index);
+            heap.made.set(index, 0);
+            assert!(neutral_for(&view, heap.at(index)).is_some(), "a neutral stand-in");
+            heap.put(index);
+        }
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0,numDescriptors=1,flags=DESCRIPTORS_VOLATILE)), UAV(u0)"
+Texture2D<float4> t : register(t0);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint w, h, n;
+    t.GetDimensions(0, w, h, n);
+    o.Store(0, w);
+    o.Store(4, h);
+}
+"#;
+        // SAFETY: plain creation, recording and submission on a queue of
+        // this test's; everything named lives until the queue has run.
+        unsafe {
+            let mut code: Option<ID3DBlob> = None;
+            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("flight"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None)
+                .expect("the pass compiles");
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let (out, data) = host.shared_buffer(256).expect("a mapped buffer");
+            std::ptr::write_bytes(data, 0, 8);
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let table = D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: heap.heap.GetGPUDescriptorHandleForHeapStart().ptr + u64::from(index) * u64::from(heap.step),
+            };
+            list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.SetComputeRootSignature(&root);
+            list.SetPipelineState(&pso);
+            list.SetComputeRootDescriptorTable(0, table);
+            list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.Dispatch(1, 1, 1);
+            list.Close().unwrap();
+            // Submitted, held on the card behind a fence: a list in the air.
+            let gate: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            queue.Signal(&done, 1).unwrap();
+            // Its upload has run: the flip `texture_slot_show_ahead` queues.
+            let late = Some(crate::frame::current());
+            let heap_at = std::ptr::from_ref(&heap) as usize;
+            FLIPS.lock().unwrap().push(Flip { after: 0, heap: heap_at, index, handle, key, late, asked: 0 });
+            heap.texture_slots_flip();
+            let flipped = heap.made.get(index) == Some(key);
+            // The list runs now.
+            gate.Signal(1).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            done.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+            let read = [data.cast::<u32>().read_volatile(), data.cast::<u32>().add(1).read_volatile()];
+            assert!(device.GetDeviceRemovedReason().is_ok());
+            assert_eq!(
+                read,
+                [1, 1],
+                "the list recorded against the neutral texture read the texture shown under it (slot flipped while it was in the air: {flipped})"
+            );
+            // Afterwards it is shown.
+            heap.texture_slots_flip();
+            assert_eq!(heap.made.get(index), Some(key), "shown once nothing reads the slot");
+        }
+    }
 }
 
 /// What is known of a record a list's tables hold, in that recording of the
